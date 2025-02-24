@@ -7,7 +7,7 @@ import torch
 from trl import SFTTrainer
 from transformers import TrainingArguments
 from unsloth import is_bfloat16_supported
-from llama_finetune import generate_finetune_data
+from llama_finetune_unsloth import generate_finetune_data
 
 
 

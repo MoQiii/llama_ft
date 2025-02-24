@@ -12,7 +12,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import transformers
 from trl import SFTTrainer
 from trl.trainer import ConstantLengthDataset
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model,TaskType
 import bitsandbytes as bnb
 
 # accelerate launch llama_finetune.py --num_processes 2
@@ -27,7 +27,7 @@ import bitsandbytes as bnb
 # dataset = load_dataset("philschmid/dolly-15k-oai-style", split="train")
 # print()
 
-device_string = "cuda:0"
+# device_string = "cuda:0"
 
 # model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
 model_id = "/mnt/HDD/syj/model/Llama-2-7b"
@@ -54,21 +54,8 @@ def generate_finetune_data():
         ]
         
         dataset["messages"].append(messages)
-    dataset = Dataset.from_dict(dataset,trust_remote_code=True)
+    dataset = Dataset.from_dict(dataset)
     return dataset
-
-# generate_finetune_data()
-
-def find_all_linear_names(model):
-    cls = bnb.nn.Linear4bit #if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
-    lora_module_names = set()
-    for name, module in model.named_modules():
-        if isinstance(module, cls):
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-        if 'lm_head' in lora_module_names: # needed for 16-bit
-            lora_module_names.remove('lm_head')
-    return list(lora_module_names)
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -77,26 +64,53 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
 )
 
-tokenizer = AutoTokenizer.from_pretrained(
-    model_id, token=access_token,
-    padding_side="left", add_eos_token=True, add_bos_token=True, 
-)
-
 model = AutoModelForCausalLM.from_pretrained(
-    model_id, 
-    quantization_config=bnb_config, 
-    # device_map={"": device_string}, 
-    device_map = "auto",
-    token=access_token,
-    attn_implementation="sdpa"
+    "/mnt/HDD/syj/model/glm-4-9b", 
+    device_map={'':torch.cuda.current_device()},
+    torch_dtype=torch.bfloat16,
+    # quantization_config=bnb_config,  
+    trust_remote_code=True
+    )
+
+tokenizer = AutoTokenizer.from_pretrained(
+    '/mnt/HDD/syj/model/glm-4-9b',
+    # use_fast=False, 
+    # padding_side="left",
+    # add_eos_token=True, 
+    # add_bos_token=True, 
+    trust_remote_code=True
+    )
+
+# tokenizer = AutoTokenizer.from_pretrained(
+#     model_id, token=access_token,
+#     padding_side="left", add_eos_token=True, add_bos_token=True, 
+# )
+
+# model = AutoModelForCausalLM.from_pretrained(
+#     model_id, 
+#     quantization_config=bnb_config, 
+#     # device_map={"": device_string}, 
+#     device_map = "auto",
+#     token=access_token,
+#     attn_implementation="sdpa"
+# )
+
+# lora_config = LoraConfig(
+#     r=8,
+#     target_modules = find_all_linear_names(model),
+#     task_type="CAUSAL_LM",
+# )
+config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    # target_modules=["query_key_value", "dense", "dense_h_to_4h", "activation_func", "dense_4h_to_h"],
+    target_modules=["query_key_value"],
+    inference_mode=False,  # 训练模式
+    r=4,  # Lora 秩
+    lora_alpha=32,  # Lora alaph，具体作用参见 Lora 原理
+    lora_dropout=0.1,  # Dropout 比例
 )
 
-lora_config = LoraConfig(
-    r=8,
-    target_modules = find_all_linear_names(model),
-    task_type="CAUSAL_LM",
-)
-
+model = get_peft_model(model, config)
 
 dataset = generate_finetune_data()
 
@@ -104,31 +118,43 @@ trainer = SFTTrainer(
     model=model,
     train_dataset=dataset,
     args=transformers.TrainingArguments(
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
         warmup_steps=2,
-        max_steps=200,
+        max_steps=1,
         # num_train_epochs=10,
         learning_rate=5e-4,
         fp16=True,
         save_strategy="steps", # epoch
         save_steps=100,
-        output_dir="lbsn_model",
+        output_dir="/mnt/HDD/syj/syj_poi/poi_query/ft_model/lora/",
         save_total_limit=5,
         optim="paged_adamw_8bit",
         logging_dir="./logs/training.log",
         logging_strategy="steps",
         logging_steps=5,
         logging_first_step=True,
-        report_to="none"
+        # packing=True,
+        # max_seq_length=5120,
         # gradient_checkpointing_kwargs={'use_reentrant':False}
         # strategy="ddp_find_unused_parameters_false"
     ),
-    peft_config=lora_config,
+    # peft_config=lora_config,
     packing=True,
-    max_seq_length=2048,
+    max_seq_length=5120,
 )
 
 trainer.train(resume_from_checkpoint=False)
 
-# for obj in trainer.state.log_history:
+# 保存 LoRA 模型
+trainer.save_model()
+
+# 合并模型
+merged_model = trainer.model.merge_and_unload()
+
+# 保存合并后的模型
+merged_model.save_pretrained(
+    "/mnt/HDD/syj/syj_poi/poi_query/ft_model/meged_model",
+    safe_serialization=True
+)
+tokenizer.save_pretrained("/mnt/HDD/syj/syj_poi/poi_query/ft_model/meged_model")
